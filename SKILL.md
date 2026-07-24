@@ -1,6 +1,6 @@
 ---
 name: antibot-crawler
-description: Universal anti-detection web crawler combining best features of Firecrawl, Scrapling, Scrapy. TLS fingerprinting, Cloudflare bypass, proxy rotation, CAPTCHA solving, adaptive selectors, 5-method paywall bypass engine.
+description: Universal anti-detection web crawler combining best features of Firecrawl, Scrapling, Scrapy. TLS fingerprinting, Cloudflare bypass, proxy rotation, CAPTCHA solving, adaptive selectors, 5-method paywall bypass engine. Integrated into main fetch pipeline with auto-detection and multi-strategy bypass.
 version: 2.0.0
 ---
 

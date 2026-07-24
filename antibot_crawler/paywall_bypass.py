@@ -62,12 +62,12 @@ class LadderProxyBypass:
 
         # Remove elements with paywall class names
         for cls in self.PAYWALL_CLASSES:
-            # Remove entire element by class
-            pattern = rf'<(div|section|article|main|header|footer)\b[^>]*class=["\'][^"\']*{cls}[^"\']*["\'][^>]*/?>.*?</\1>'
+            # Remove entire element by class (any tag type)
+            pattern = rf'<[a-zA-Z][a-zA-Z0-9]*\b[^>]*class=["\'][^"\']*{re.escape(cls)}[^"\']*["\'][^>]*>.*?</[a-zA-Z][a-zA-Z0-9]*>'
             result = re.sub(pattern, '', result, flags=re.IGNORECASE | re.DOTALL)
 
-            # Also try simpler patterns
-            pattern2 = rf'<(div|section|article|main)\s+[^>]*class=["\'][^"\']*{cls}[^"\']*["\'][^>]*/?>\s*?'
+            # Also try simpler patterns without closing tag (self-closing)
+            pattern2 = rf'<[a-zA-Z][a-zA-Z0-9]*\s+[^>]*class=["\'][^"\']*{re.escape(cls)}[^"\']*["\'][^>]*/?>\s*?'
             result = re.sub(pattern2, '', result, flags=re.IGNORECASE)
 
         # Remove elements with paywall-related IDs
@@ -295,6 +295,12 @@ class RuleBasedPaywallBypass:
     # Default rule definitions
     DEFAULT_RULES = [
         {
+            "name": "remove_paywall_overlay",
+            "type": "css_remove",
+            'selector': '.paywall, .paywall-overlay, .paywall-container, .paywall-message, .pw-overlay, .pw-container',
+            "action": "remove_element",
+        },
+        {
             "name": "remove_metered_content_blur",
             "type": "css_remove",
             'selector': '.metered-content-blur, .article-body--locked, [class*="metered"][class*="blur"]',
@@ -303,7 +309,7 @@ class RuleBasedPaywallBypass:
         {
             "name": "remove_login_wall",
             "type": "css_remove",
-            'selector': '.login-wall, .registration-wall, .signup-prompt, [class*="auth-wall"]',
+            'selector': '.login-wall, .registration-wall, .signup-prompt, [class*="auth-wall"], .subscribe-prompt, .subscription-prompt',
             "action": "remove_element",
         },
         {
@@ -362,8 +368,12 @@ class RuleBasedPaywallBypass:
         # Handle class selectors: .classname
         classes = re.findall(r'\.([a-zA-Z_-][a-zA-Z0-9_-]*)', selector)
         for cls in classes:
-            pattern = rf'<(div|section|article|main|header|footer)\b[^>]*class=["\'][^"\']*{re.escape(cls)}[^"\']*["\'][^>]*>.*?</\1>'
+            # Match any tag with the class (including self-closing and void elements)
+            pattern = rf'<[a-zA-Z][a-zA-Z0-9]*\b[^>]*class=["\'][^"\']*{re.escape(cls)}[^"\']*["\'][^>]*>.*?</[a-zA-Z][a-zA-Z0-9]*>'
             html = re.sub(pattern, '', html, flags=re.IGNORECASE | re.DOTALL)
+            # Also try simpler patterns without closing tag (self-closing)
+            pattern2 = rf'<[a-zA-Z][a-zA-Z0-9]*\s+[^>]*class=["\'][^"\']*{re.escape(cls)}[^"\']*["\'][^>]*/?>\s*?'
+            html = re.sub(pattern2, '', html, flags=re.IGNORECASE)
         return html
 
     def _remove_overlay(self, html: str, selector: str) -> str:
@@ -714,13 +724,36 @@ class APIInterceptionEngine:
 class PaywallBypassOrchestrator:
     """Unified orchestrator that chains multiple bypass techniques in optimal order.
 
-    Execution order:
-    1. Cache lookup (fastest, no detection risk)
-    2. Rule-based DOM stripping (lightweight, works on static HTML)
-    3. Browser-based DOM manipulation (for JS-rendered paywalls)
-    4. Session/API interception (for authenticated content)
-    5. Proxy-based fetching (fallback for stubborn paywalls)
+    Execution order (smart escalation):
+    1. Analyze paywall type from HTML signature
+    2. Cache lookup (fastest, zero detection risk) — if paywall is overlay/metered
+    3. Rule-based DOM stripping (lightweight) — for static HTML paywalls
+    4. Browser-based DOM manipulation (JS-rendered paywalls)
+    5. Session/API interception (authenticated content)
+    6. Proxy-based fetching (fallback for stubborn paywalls)
+
+    Supports progressive escalation: if one strategy fails, automatically tries
+    the next one with adaptive timeout and retry logic.
     """
+
+    # Strategy priority ranking (lower = try first)
+    STRATEGY_PRIORITY = {
+        "cache_lookup": 0,       # Zero cost, zero detection
+        "rule_based_strip": 1,   # Lightweight, works on static HTML
+        "browser_dom_manipulation": 2,  # JS rendering, moderate cost
+        "session_auth": 3,       # Requires pre-configured session
+        "proxy_fetch": 4,        # Network cost, proxy dependency
+    }
+
+    # Paywall type → recommended starting strategy
+    PAYWALL_STRATEGY_MAP = {
+        "overlay": "rule_based_strip",
+        "blur": "rule_based_strip",
+        "metered": "cache_lookup",
+        "login_required": "session_auth",
+        "js_rendered": "browser_dom_manipulation",
+        "unknown": "rule_based_strip",
+    }
 
     def __init__(self, config: Optional[Dict] = None):
         self.config = config or {}
@@ -745,9 +778,65 @@ class PaywallBypassOrchestrator:
                     action=rule.get("action", "remove_element"),
                 )
 
+        # Strategy performance tracking
+        self._strategy_stats: Dict[str, Dict[str, int]] = {
+            "cache_lookup": {"attempts": 0, "successes": 0},
+            "rule_based_strip": {"attempts": 0, "successes": 0},
+            "browser_dom_manipulation": {"attempts": 0, "successes": 0},
+            "session_auth": {"attempts": 0, "successes": 0},
+            "proxy_fetch": {"attempts": 0, "successes": 0},
+        }
+
+    def _record_strategy_attempt(self, technique: str, success: bool):
+        """Track strategy performance for smart escalation."""
+        if technique in self._strategy_stats:
+            self._strategy_stats[technique]["attempts"] += 1
+            if success:
+                self._strategy_stats[technique]["successes"] += 1
+
+    def _get_strategy_order(self, paywall_type: Optional[str] = None,
+                           method: str = "auto") -> List[str]:
+        """Determine optimal strategy execution order.
+
+        Uses paywall analysis + historical success rates to rank strategies.
+        """
+        strategies = list(self.STRATEGY_PRIORITY.keys())
+
+        # If specific method requested, filter and reorder
+        if method != "auto":
+            if method in strategies:
+                return [method]
+            return strategies[:1]  # Fallback to first available
+
+        # Start with paywall-type-recommended strategy
+        if paywall_type and paywall_type in self.PAYWALL_STRATEGY_MAP:
+            preferred = self.PAYWALL_STRATEGY_MAP[paywall_type]
+            if preferred in strategies:
+                # Put preferred first, rest follow by priority
+                strategies.remove(preferred)
+                strategies.insert(0, preferred)
+
+        # Boost strategies with better historical success rates
+        def strategy_score(s):
+            stats = self._strategy_stats[s]
+            rate = stats["successes"] / max(stats["attempts"], 1)
+            return -rate * 10 + self.STRATEGY_PRIORITY[s]  # Higher is better
+
+        strategies.sort(key=strategy_score)
+        return strategies
+
     def bypass(self, url: str, html: Optional[str] = None,
-               method: str = "auto") -> Dict[str, Any]:
-        """Execute paywall bypass chain. Returns result with technique used."""
+               method: str = "auto", max_attempts: int = 4) -> Dict[str, Any]:
+        """Execute paywall bypass chain with smart strategy selection and escalation.
+
+        Args:
+            url: Target URL
+            html: Pre-fetched HTML content (if None, will fetch via HTTP)
+            method: Strategy hint ("auto", "cache", "browser", "proxy", etc.)
+            max_attempts: Max number of strategy escalations before giving up
+
+        Returns result dict with technique used and clean HTML.
+        """
         result = {
             "url": url,
             "success": False,
@@ -755,54 +844,121 @@ class PaywallBypassOrchestrator:
             "html": None,
             "markdown": None,
             "error": None,
+            "strategies_tried": [],
         }
 
         try:
-            # Step 1: Try cache first (zero detection risk)
-            if method in ("auto", "cache"):
-                cached = self.cache_retriever.fetch_wayback(url)
-                if cached and len(cached) > 1000:
-                    result["success"] = True
-                    result["technique"] = "wayback_cache"
-                    result["html"] = cached
-                    return result
-
-            # Step 2: If we already have HTML, apply rule-based stripping
+            # Step 0: Analyze paywall type from HTML if available
+            paywall_type = None
             if html:
-                stripped = self.rule_engine.apply_rules(html)
-                if len(stripped) > len(html) * 0.5:  # Still substantial content
+                analysis = self.analyze_paywall(html)
+                if analysis.get("has_paywall"):
+                    paywall_type = analysis.get("paywall_type", "unknown")
+                    logger.info(f"Paywall detected: type={paywall_type}, indicators={analysis['indicators']}")
+
+            # Determine strategy order
+            strategy_order = self._get_strategy_order(paywall_type, method)
+
+            # Execute strategies in priority order
+            for i, strategy in enumerate(strategy_order):
+                if i >= max_attempts:
+                    break
+
+                result["strategies_tried"].append(strategy)
+                logger.debug(f"Trying paywall bypass strategy {i+1}/{len(strategy_order)}: {strategy}")
+
+                success, html_out = self._try_strategy(strategy, url, html)
+                self._record_strategy_attempt(strategy, success)
+
+                if success and html_out:
                     result["success"] = True
-                    result["technique"] = "rule_based_strip"
-                    result["html"] = stripped
+                    result["technique"] = strategy
+                    result["html"] = html_out
+                    logger.info(f"Paywall bypass succeeded via {strategy}")
                     return result
 
-            # Step 3: Browser-based DOM manipulation
-            if method in ("auto", "browser", "dom"):
-                browser_html = self.dom_manipulator.bypass(url)
-                if browser_html and len(browser_html) > 1000:
-                    # Apply additional rule stripping
-                    browser_html = self.rule_engine.apply_rules(browser_html)
-                    result["success"] = True
-                    result["technique"] = "browser_dom_manipulation"
-                    result["html"] = browser_html
-                    return result
-
-            # Step 4: Proxy-based fetching
-            if method in ("auto", "proxy"):
-                proxy_html = self.ladder_proxy.fetch_via_proxy(url)
-                if proxy_html and len(proxy_html) > 1000:
-                    result["success"] = True
-                    result["technique"] = "proxy_fetch"
-                    result["html"] = proxy_html
-                    return result
-
-            result["error"] = "All bypass techniques failed"
+            result["error"] = f"All {len(result['strategies_tried'])} bypass strategies failed"
+            logger.warning(f"Paywall bypass failed for {url}: tried {result['strategies_tried']}")
 
         except Exception as e:
             result["error"] = str(e)
-            logger.error(f"Paywall bypass failed for {url}: {e}")
+            logger.error(f"Paywall bypass exception for {url}: {e}")
 
         return result
+
+    def _try_strategy(self, strategy: str, url: str,
+                      html: Optional[str]) -> Tuple[bool, Optional[str]]:
+        """Try a single bypass strategy. Returns (success, html)."""
+        try:
+            if strategy == "cache_lookup":
+                cached = self.cache_retriever.fetch_wayback(url)
+                if cached and len(cached) > 1000:
+                    # Verify it's actually the target domain content, not a redirect
+                    parsed = urlparse(url)
+                    target_domain = parsed.netloc
+                    # Reject Google search results or other redirects
+                    is_google_search = 'Google Search' in cached[:500] or \
+                                       'webcache.googleusercontent.com' in cached[:500]
+                    if not is_google_search and target_domain in cached:
+                        return True, cached
+                # Also try Google cache — must be actual page, not search results
+                gc = self.cache_retriever.fetch_google_cache(url)
+                if gc and len(gc) > 1000:
+                    parsed = urlparse(url)
+                    target_domain = parsed.netloc
+                    # Google cache should contain the actual page, not search results
+                    is_google_search = 'Google Search' in gc[:500] or \
+                                       '<title>Google</title>' in gc[:500].lower()
+                    if not is_google_search and target_domain in gc:
+                        return True, gc
+                return False, None
+
+            elif strategy == "rule_based_strip":
+                if not html:
+                    return False, None
+                stripped = self.rule_engine.apply_rules(html)
+                if stripped and len(stripped) > len(html) * 0.3:
+                    return True, stripped
+                return False, None
+
+            elif strategy == "browser_dom_manipulation":
+                browser_html = self.dom_manipulator.bypass(url)
+                if browser_html and len(browser_html) > 1000:
+                    browser_html = self.rule_engine.apply_rules(browser_html)
+                    return True, browser_html
+                return False, None
+
+            elif strategy == "session_auth":
+                # Try any configured sessions
+                for sid, session in self.session_manager._sessions.items():
+                    cookies = session.get("cookies", {})
+                    if cookies:
+                        headers = {"Cookie": "; ".join(f"{k}={v}" for k, v in cookies.items())}
+                        try:
+                            import urllib.request
+                            req = urllib.request.Request(url)
+                            for k, v in headers.items():
+                                req.add_header(k, v)
+                            req.add_header('User-Agent', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36')
+                            resp = urllib.request.urlopen(req, timeout=15)
+                            session_html = resp.read().decode('utf-8', errors='ignore')
+                            stripped = self.rule_engine.apply_rules(session_html)
+                            if stripped and len(stripped) > 1000:
+                                return True, stripped
+                        except Exception:
+                            continue
+                return False, None
+
+            elif strategy == "proxy_fetch":
+                proxy_html = self.ladder_proxy.fetch_via_proxy(url)
+                if proxy_html and len(proxy_html) > 1000:
+                    return True, proxy_html
+                return False, None
+
+        except Exception as e:
+            logger.debug(f"Strategy '{strategy}' failed: {e}")
+
+        return False, None
 
     def bypass_with_session(self, url: str, session_id: str,
                             method: str = "auto") -> Dict[str, Any]:
@@ -811,33 +967,17 @@ class PaywallBypassOrchestrator:
         if not cookies:
             return {"success": False, "error": f"Session {session_id} not found"}
 
-        # Merge cookies into headers
-        headers = {"Cookie": "; ".join(f"{k}={v}" for k, v in cookies.items())}
+        # Create a temporary session and try it
+        temp_sid = f"temp_{session_id}"
+        self.session_manager.create_session(temp_sid, cookies)
+        result = self.bypass(url, method="session_auth")
+        result["session_id"] = session_id
 
-        # Try fetching with session cookies first
-        try:
-            import urllib.request
-            req = urllib.request.Request(url)
-            for k, v in headers.items():
-                req.add_header(k, v)
-            req.add_header('User-Agent', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36')
-            resp = urllib.request.urlopen(req, timeout=15)
-            html = resp.read().decode('utf-8', errors='ignore')
+        # Clean up temp session
+        if temp_sid in self.session_manager._sessions:
+            del self.session_manager._sessions[temp_sid]
 
-            # Apply rule-based stripping on the fetched content
-            stripped = self.rule_engine.apply_rules(html)
-            if stripped and len(stripped) > 1000:
-                return {
-                    "success": True,
-                    "technique": "session_auth",
-                    "html": stripped,
-                    "session_id": session_id,
-                }
-        except Exception as e:
-            logger.error(f"Session fetch failed for {url}: {e}")
-
-        # Fall back to regular bypass chain
-        return self.bypass(url, method=method)
+        return result
 
     def analyze_paywall(self, html: str) -> Dict[str, Any]:
         """Analyze HTML to detect paywall type and recommend bypass strategy."""

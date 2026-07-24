@@ -45,6 +45,21 @@ class AntiBotCrawler:
         self.robots_parser = RobotsParser()
         self.content_extractor = ContentExtractor()
         
+        # Paywall bypass engine (v2.0)
+        if self.config.enable_paywall_bypass:
+            try:
+                from antibot_crawler.paywall_bypass import PaywallBypassOrchestrator
+                self.paywall_orchestrator = PaywallBypassOrchestrator({
+                    "proxy_url": self.config.paywall_proxy_url,
+                    "headless": not self.config.headless,
+                    "custom_rules": self.config.paywall_custom_rules,
+                })
+            except ImportError:
+                logger.warning("Paywall bypass module not available")
+                self.paywall_orchestrator = None
+        else:
+            self.paywall_orchestrator = None
+        
         if self.config.solve_captcha and self.config.captcha_api_key:
             self.captcha_solver = CaptchaSolver(
                 self.config.captcha_service or "2captcha",
@@ -111,6 +126,10 @@ class AntiBotCrawler:
         
         # Process content
         if result.status_code == 200 and result.content:
+            # Paywall detection and bypass (v2.0)
+            if self.paywall_orchestrator:
+                result = self._apply_paywall_bypass(result)
+            
             result.markdown = self.content_extractor.html_to_markdown(result.content)
             if self.config.extract_links:
                 links = self.content_extractor.extract_links(result.content, url)
@@ -191,6 +210,74 @@ class AntiBotCrawler:
         
         return results
     
+    def _apply_paywall_bypass(self, result: Any) -> Any:
+        """Apply paywall bypass chain to a crawl result.
+        
+        Strategy order (auto mode):
+        1. Rule-based stripping of known paywall overlays
+        2. Browser-based DOM manipulation for JS-rendered paywalls
+        3. Proxy-based fetching as fallback
+        """
+        if not self.paywall_orchestrator or not result.content:
+            return result
+        
+        strategy = self.config.paywall_bypass_strategy
+        
+        # If session ID provided, use session-authenticated bypass first
+        if self.config.paywall_session_id:
+            logger.info(f"Using session {self.config.paywall_session_id} for paywall bypass")
+            session_result = self.paywall_orchestrator.bypass_with_session(
+                result.url,
+                self.config.paywall_session_id,
+                method=strategy
+            )
+            if session_result.get("success"):
+                result.content = session_result["html"]
+                result.paywall_bypassed = True
+                result.paywall_technique = session_result.get("technique", "session_auth")
+                logger.info(f"Paywall bypass succeeded via {result.paywall_technique}")
+                return result
+        
+        # Try orchestrator bypass with pre-fetched HTML
+        bypass_result = self.paywall_orchestrator.bypass(
+            result.url,
+            html=result.content,
+            method=strategy
+        )
+        
+        if bypass_result.get("success"):
+            old_content_len = len(result.content)
+            result.content = bypass_result["html"]
+            result.paywall_bypassed = True
+            result.paywall_technique = bypass_result.get("technique", "unknown")
+            stripped_chars = old_content_len - len(result.content)
+            logger.info(
+                f"Paywall bypass succeeded via {result.paywall_technique} "
+                f"({old_content_len}→{len(result.content)} chars, "
+                f"removed {stripped_chars} chars)"
+            )
+        else:
+            # Analyze what kind of paywall we're dealing with
+            analysis = self.paywall_orchestrator.analyze_paywall(result.content)
+            if analysis.get("has_paywall"):
+                logger.warning(
+                    f"Paywall detected ({analysis['paywall_type']}) but bypass failed. "
+                    f"Recommended: {analysis['recommended_technique']}. "
+                    f"Indicators: {analysis['indicators']}"
+                )
+                # Add paywall info to result metadata
+                result.elements.append({
+                    "type": "paywall_analysis",
+                    "has_paywall": True,
+                    "paywall_type": analysis.get("paywall_type"),
+                    "indicators": analysis.get("indicators", []),
+                    "recommended_technique": analysis.get("recommended_technique"),
+                })
+            else:
+                logger.debug("No paywall detected in content")
+        
+        return result
+    
     def analyze_protection(self, url: str) -> Dict[str, Any]:
         """
         Analyze what anti-bot protections a website uses.
@@ -224,7 +311,8 @@ class AntiBotCrawler:
             f"AntiBotCrawler("
             f"browser={'enabled' if self.browser_fetcher else 'disabled'}, "
             f"proxies={len(self.config.proxies) if self.config.proxies else 0}, "
-            f"stealth={self.config.stealth_mode})"
+            f"stealth={self.config.stealth_mode}, "
+            f"paywall_bypass={'enabled' if self.paywall_orchestrator else 'disabled'})"
         )
 
 
@@ -276,6 +364,14 @@ def main():
                        help="Enable verbose logging")
     parser.add_argument("--analyze", action="store_true",
                        help="Analyze anti-bot protections instead of fetching")
+    parser.add_argument("--paywall-bypass", action="store_true",
+                       help="Enable paywall bypass engine (v2.0)")
+    parser.add_argument("--paywall-strategy", choices=["auto", "cache", "browser", "proxy"],
+                       default="auto", help="Paywall bypass strategy")
+    parser.add_argument("--paywall-proxy", type=str,
+                       help="Proxy URL for paywall bypass")
+    parser.add_argument("--paywall-session", type=str,
+                       help="Session ID for authenticated paywall bypass")
     
     args = parser.parse_args()
     
@@ -292,6 +388,11 @@ def main():
         proxies=proxies if proxies else None,
         verbose=args.verbose,
         output_format=OutputFormat[args.output_format.upper()],
+        # Paywall bypass (v2.0)
+        enable_paywall_bypass=args.paywall_bypass,
+        paywall_bypass_strategy=args.paywall_strategy,
+        paywall_proxy_url=args.paywall_proxy,
+        paywall_session_id=args.paywall_session,
     )
     
     crawler = AntiBotCrawler(config)
@@ -319,6 +420,10 @@ def main():
             print(json.dumps(result.to_dict(), indent=2))
         else:
             print(result.content)
+        
+        # Show paywall bypass summary (v2.0)
+        if getattr(result, 'paywall_bypassed', False):
+            print(f"\n[Paywall Bypass] Technique: {getattr(result, 'paywall_technique', 'unknown')}")
 
 
 if __name__ == "__main__":

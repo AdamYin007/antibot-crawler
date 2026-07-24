@@ -21,11 +21,15 @@ logger = logging.getLogger(__name__)
 
 class ImpersonateTarget(Enum):
     """Browser types to impersonate for TLS fingerprint cloning."""
-    CHROME_120 = "chrome"
+    CHROME = "chrome"
+    CHROME_120 = "chrome120"
     CHROME_133 = "chrome133"
-    FIREFOX_133 = "firefox"
-    SAFARI_18_3 = "safari"
-    EDGE_120 = "edge"
+    FIREFOX = "firefox"
+    FIREFOX_133 = "firefox133"
+    SAFARI = "safari"
+    SAFARI_18_3 = "safari18.3"
+    EDGE = "edge"
+    EDGE_120 = "edge120"
     RANDOM = "random"
 
 
@@ -97,6 +101,8 @@ class CrawlResult:
     bot_detected: bool = False
     captcha_required: bool = False
     cloudflare_bypassed: bool = False
+    paywall_bypassed: bool = False
+    paywall_technique: Optional[str] = None
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -109,6 +115,8 @@ class CrawlResult:
             "bot_detected": self.bot_detected,
             "captcha_required": self.captcha_required,
             "cloudflare_bypassed": self.cloudflare_bypassed,
+            "paywall_bypassed": getattr(self, 'paywall_bypassed', False),
+            "paywall_technique": getattr(self, 'paywall_technique', None),
         }
 
 
@@ -116,7 +124,7 @@ class CrawlResult:
 class CrawlerConfig:
     """Main crawler configuration."""
     # Anti-detection settings
-    impersonate: ImpersonateTarget = ImpersonateTarget.CHROME_133
+    impersonate: ImpersonateTarget = ImpersonateTarget.CHROME
     stealth_mode: bool = True
     simulate_behavior: bool = True
     random_delay_range: Tuple[float, float] = (0.5, 2.0)
@@ -165,6 +173,13 @@ class CrawlerConfig:
     # Logging
     verbose: bool = False
     log_file: Optional[str] = None
+    
+    # Paywall bypass settings (v2.0)
+    enable_paywall_bypass: bool = False
+    paywall_bypass_strategy: str = "auto"  # auto / cache / browser / proxy / session
+    paywall_proxy_url: Optional[str] = None
+    paywall_custom_rules: Optional[List[Dict]] = None
+    paywall_session_id: Optional[str] = None
 
 
 DEFAULT_USER_AGENTS = [

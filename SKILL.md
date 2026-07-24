@@ -1,7 +1,7 @@
 ---
 name: antibot-crawler
-description: Universal anti-detection web crawler combining best features of Firecrawl, Scrapling, Scrapy. TLS fingerprinting, Cloudflare bypass, proxy rotation, CAPTCHA solving, adaptive selectors.
-version: 1.0.0
+description: Universal anti-detection web crawler combining best features of Firecrawl, Scrapling, Scrapy. TLS fingerprinting, Cloudflare bypass, proxy rotation, CAPTCHA solving, adaptive selectors, 5-method paywall bypass engine.
+version: 2.0.0
 ---
 
 # AntiBotCrawler Skill
@@ -10,7 +10,7 @@ Universal web scraping toolkit that combines the best features of GitHub's top 5
 
 ## Source Analysis
 
-Built by studying these 5 top-starred projects:
+Built by studying these 10 top-starred projects (5 crawlers + 5 paywall bypass):
 
 | # | Project | ⭐ | What We Learned |
 |---|---------|-----|-----------------|
@@ -19,6 +19,11 @@ Built by studying these 5 top-starred projects:
 | 3 | **Scrapy** | 63k | Middleware architecture, async pipelines, concurrent crawling, distributed deployment |
 | 4 | **You-Get** | 57k | Minimal CLI design, zero-config out-of-box, multi-site support |
 | 5 | **Browser Fingerprinting** | 5k | Anti-bot system analysis matrix, scenario-based countermeasure recommendations, CAPTCHA service integration |
+| 6 | **Ladder** | 8730 | Self-hosted proxy for HTML modification, CORS removal, paywall overlay stripping |
+| 7 | **12ft Extension** | 34 | Browser extension approach - DOM manipulation to remove paywall overlays |
+| 8 | **Ladder Rules** | 34 | Rule-based paywall detection with configurable CSS selectors and actions |
+| 9 | **Archive.org** | N/A | Historical content retrieval as fallback when paywalls block current access |
+| 10 | **API Interception** | N/A | Intercept AJAX/fetch calls that serve content behind paywalls |
 
 ## Installation
 
@@ -100,7 +105,8 @@ AntiBotCrawler (orchestrator)
 ├── BehaviorSimulator    → Human-like mouse movement, scroll patterns, random delays
 ├── AdaptiveSelector     → Element tracking across page structure changes
 ├── ContentExtractor     → HTML → Markdown/JSON/structured data extraction
-└── RobotsParser         → robots.txt compliance checking
+├── RobotsParser         → robots.txt compliance checking
+└── PaywallBypassEngine  → 5 techniques: proxy DOM strip, browser JS, rules, cache, session/API
 ```
 
 ## Key Capabilities
@@ -144,6 +150,100 @@ Optional (for CAPTCHA):
 - robots.txt compliance check before each request
 - Configurable rate limiting to avoid triggering anti-bot systems
 - Detailed error reporting in `CrawlResult.error` field
+
+## 付费墙绕过引擎 (v2.0 新增)
+
+基于GitHub Top 5付费墙绕过工具分析，集成5种核心技术：
+
+### 1. Ladder代理模式 (⭐8730)
+自动移除HTML中的付费墙覆盖层、CORS限制、模糊效果。
+
+```python
+from antibot_crawler.paywall_bypass import LadderProxyBypass
+
+bypass = LadderProxyBypass()
+clean_html = bypass.strip_paywall_overlays(html_content)
+```
+
+### 2. DOM操作 (NMAC427/12ft)
+通过stealth浏览器执行JavaScript移除付费墙遮罩。
+
+```python
+from antibot_crawler.paywall_bypass import DOMManipulationBypass
+
+bypass = DOMManipulationBypass(headless=True)
+html = bypass.bypass("https://example.com/article")
+```
+
+### 3. 规则引擎 (ladder-rules)
+可配置的CSS选择器规则，支持自定义规则添加。
+
+```python
+from antibot_crawler.paywall_bypass import RuleBasedPaywallBypass
+
+engine = RuleBasedPaywallBypass()
+engine.add_rule("custom-rule", ".my-paywall-class", "remove_element")
+clean_html = engine.apply_rules(html)
+```
+
+### 4. 缓存查询 (Archive.org)
+获取Wayback Machine和Google缓存的历史版本。
+
+```python
+from antibot_crawler.paywall_bypass import CacheContentRetriever
+
+cache = CacheContentRetriever()
+archive_url = cache.get_wayback_url("https://example.com/article")
+cached_html = cache.fetch_wayback("https://example.com/article")
+```
+
+### 5. 会话管理与API拦截
+管理Cookie/Session，拦截和重放内容API调用。
+
+```python
+from antibot_crawler.paywall_bypass import SessionCookieManager, APIInterceptionEngine
+
+# 会话管理
+session_mgr = SessionCookieManager()
+session_mgr.create_session("my-session", {"auth_token": "xxx"})
+
+# API拦截
+api_engine = APIInterceptionEngine()
+apis = api_engine.find_content_apis(html)
+```
+
+### 统一编排器 (推荐入口)
+```python
+from antibot_crawler.paywall_bypass import PaywallBypassOrchestrator
+
+orchestrator = PaywallBypassOrchestrator()
+
+# 分析付费墙类型
+analysis = orchestrator.analyze_paywall(html)
+print(analysis["paywall_type"])  # overlay / blur / metered / unknown
+print(analysis["recommended_technique"])
+
+# 执行绕过（自动选择最佳策略）
+result = orchestrator.bypass("https://example.com/article")
+print(result["success"])       # True/False
+print(result["technique"])     # 使用的技术名称
+print(result["html"])          # 清理后的HTML
+
+# 使用已认证会话
+result = orchestrator.bypass_with_session(
+    "https://example.com/article",
+    session_id="my-session"
+)
+```
+
+## 付费墙绕过方法参考
+
+详见 `references/paywall-bypass-methods.md`，包含GitHub Top 5付费墙绕过工具的详细分析：
+- Ladder代理模式（⭐8730）
+- 12ft浏览器扩展
+- ladder-rules规则引擎
+- Archive.org缓存查询
+- Sci-Hub学术数据库
 
 ## License
 

@@ -260,12 +260,22 @@ class StealthBrowserFetcher:
                 
                 page = browser.pages[0] if browser.pages else browser.new_page()
                 
-                # Block unnecessary resources
                 def intercept_handler(route):
-                    if route.request.resource_type in ["image", "font", "websocket", "media"]:
-                        route.abort()
-                    else:
-                        route.continue_()
+                    """Block tracking requests."""
+                    try:
+                        # 使用正确的 patchright API - route本身就是Request对象
+                        resource_type = getattr(route, 'resource_type', None) or \
+                                      getattr(getattr(route, 'request', None), 'resource_type', '')
+                        if resource_type in ["image", "font", "websocket", "media"]:
+                            route.abort()
+                        else:
+                            route.continue_()
+                    except Exception as e:
+                        logger.error(f"Route handler error: {e}")
+                        try:
+                            route.continue_()
+                        except:
+                            pass
                 
                 page.on("request", intercept_handler)
                 

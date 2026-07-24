@@ -31,6 +31,15 @@ from antibot_crawler.fetchers import (
     StealthBrowserFetcher,
 )
 from antibot_crawler.extractor import ContentExtractor
+from antibot_crawler.paywall_bypass import (
+    PaywallBypassOrchestrator,
+    LadderProxyBypass,
+    DOMManipulationBypass,
+    RuleBasedPaywallBypass,
+    CacheContentRetriever,
+    SessionCookieManager,
+    APIInterceptionEngine,
+)
 
 __all__ = [
     "AntiBotCrawler", "scrape", "search_and_scrape", "main",
@@ -41,4 +50,11 @@ __all__ = [
     "BehaviorSimulator", "AdaptiveSelector", "RobotsParser",
     "HTTPFetcher", "StealthBrowserFetcher",
     "ContentExtractor",
+    "PaywallBypassOrchestrator",
+    "LadderProxyBypass",
+    "DOMManipulationBypass",
+    "RuleBasedPaywallBypass",
+    "CacheContentRetriever",
+    "SessionCookieManager",
+    "APIInterceptionEngine",
 ]

@@ -611,7 +611,15 @@ class APIInterceptionEngine:
     """Intercept and replay API calls that serve content behind paywalls.
 
     Many modern sites load article content via AJAX/fetch/XHR rather than
-    server-side rendering. This engine helps identify and replay those APIs.
+    server-side rendering. This engine helps identify and replay those APIs,
+    plus extract embedded JSON data from scripts (SSR payloads, hydration data).
+
+    Enhanced with auto-discovery of:
+    - Inline fetch/XHR/axios calls in script tags
+    - GraphQL queries and mutations
+    - Embedded JSON payloads (__NEXT_DATA__, __INITIAL_STATE__, window.__DATA__)
+    - JSON-LD structured data with article content
+    - REST API endpoint patterns in page source
     """
 
     # Common API endpoint patterns for article/content
@@ -625,11 +633,14 @@ class APIInterceptionEngine:
         r'/api/content/.*',
         r'/api/article/.*',
         r'/api/news/.*',
+        r'/api/v\d+/users?/?\d*/(subscriptions|plans|articles)',
     ]
 
     def __init__(self):
         self._captured_apis: List[Dict[str, Any]] = []
         self._known_endpoints: Dict[str, Dict] = {}
+        self._session_headers: Dict[str, str] = {}
+        self._auth_tokens: Dict[str, str] = {}
 
     def capture_request(self, url: str, method: str = "GET",
                         headers: Optional[Dict] = None,
@@ -651,10 +662,10 @@ class APIInterceptionEngine:
                 break
 
     def find_content_apis(self, html: str) -> List[str]:
-        """Scan HTML for inline API calls or GraphQL queries."""
+        """Scan HTML for inline API calls, GraphQL queries, or embedded content."""
         apis = []
 
-        # Look for fetch/XHR calls in inline scripts
+        # 1. Look for fetch/XHR/axios calls in inline scripts
         fetch_patterns = [
             r'fetch\s*\(\s*[`\'"]([^`\'"]*(?:api|graphql|json)[^`\'"]*)[`\'"]',
             r'axios\.(?:get|post|request)\s*\(\s*[`\'"]([^`\'"]*(?:api|graphql|json)[^`\'"]*)[`\'"]',
@@ -666,51 +677,256 @@ class APIInterceptionEngine:
             matches = re.findall(pattern, html, re.IGNORECASE)
             apis.extend(matches)
 
-        # Look for JSON data embedded in script tags
-        json_patterns = [
-            r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-            r'<script[^>]*id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
-            r'window\.__INITIAL_STATE__\s*=\s*(\{.*?\});',
-            r'window\.__NUXT__\s*=\s*(\{.*?\});',
+        # 2. Extract GraphQL queries from scripts
+        graphql_queries = self._extract_graphql(html)
+        apis.extend(graphql_queries)
+
+        # 3. Discover embedded JSON payloads (SSR/hydration data)
+        embedded = self._extract_embedded_json(html)
+        apis.extend(embedded)
+
+        return list(set(apis))
+
+    def _extract_graphql(self, html: str) -> List[str]:
+        """Extract GraphQL queries and mutations from page source."""
+        queries = []
+
+        # Find GraphQL query strings in script tags
+        gql_patterns = [
+            r'(?:query|mutation|subscription)\s+\w+\s*\([^)]*\)\s*\{[^}]*\}',
+            r'"(?:query|mutation)"\s*:\s*"([^"]*(?:query|mutation)[^"]*)"',
+            r'gql\s*\x60([^\x60]*(?:query|mutation)[^\x60]*)\x60',
+            r'apollo\.createClient\s*\(\s*\{[^}]*uri:\s*[`\'"]([^`\'"]*(?:graphql|gql)[^`\'"]*)[`\'"]',
         ]
 
-        for pattern in json_patterns:
+        for pattern in gql_patterns:
+            matches = re.findall(pattern, html, re.IGNORECASE | re.DOTALL)
+            for m in matches:
+                if len(m) > 10:  # Filter out noise
+                    queries.append(f"graphql: {m[:300]}")
+
+        return queries
+
+    def _extract_embedded_json(self, html: str) -> List[str]:
+        """Extract embedded JSON data from script tags and window variables."""
+        results = []
+
+        # Standard SSR hydration patterns
+        json_patterns = [
+            (r'<script[^>]*id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>', '__NEXT_DATA__'),
+            (r'<script[^>]*id=["\']__NUXT__["\'][^>]*>(.*?)</script>', '__NUXT__'),
+            (r'window\.__INITIAL_STATE__\s*=\s*(\{.*?\});', '__INITIAL_STATE__'),
+            (r'window\.__NUXT__\s*=\s*(\{.*?\});', '__NUXT__'),
+            (r'window\.__DATA__\s*=\s*(\{.*?\});', '__DATA__'),
+            (r'document\.addEventListener\s*\(\s*[`\'"]DOMContentLoaded["\']\s*,\s*\([^)]*\)\s*=>\s*\{[^}]*data\s*:\s*([\{][^}]*)', 'DOMContentLoaded_data'),
+        ]
+
+        for pattern, name in json_patterns:
             matches = re.findall(pattern, html, re.IGNORECASE | re.DOTALL)
             for match in matches:
                 try:
                     data = json.loads(match)
-                    apis.append(f"embedded_json: {json.dumps(data)[:200]}")
+                    # Try to find article/content fields in the JSON
+                    content_keys = ['article', 'content', 'post', 'story', 'data',
+                                    'body', 'text', 'html', 'title', 'author']
+                    found_content = False
+                    for key in content_keys:
+                        if key in str(data).lower():
+                            found_content = True
+                            break
+                    if found_content:
+                        results.append(f"{name}: {json.dumps(data)[:500]}")
                 except json.JSONDecodeError:
                     pass
 
-        return list(set(apis))
+        # Also check JSON-LD structured data
+        ld_patterns = [
+            r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+            r'<script[^>]*type=["\']application/json["\'][^>]*>(.*?)</script>',
+        ]
+        for pattern in ld_patterns:
+            matches = re.findall(pattern, html, re.IGNORECASE | re.DOTALL)
+            for match in matches:
+                try:
+                    data = json.loads(match)
+                    # Check if it's an Article or NewsArticle type
+                    if isinstance(data, dict):
+                        type_val = data.get('@type', '')
+                        if 'Article' in str(type_val) or 'News' in str(type_val):
+                            results.append(f"json-ld({type_val}): {json.dumps(data)[:500]}")
+                    elif isinstance(data, list):
+                        for item in data:
+                            if isinstance(item, dict):
+                                type_val = item.get('@type', '')
+                                if 'Article' in str(type_val) or 'News' in str(type_val):
+                                    results.append(f"json-ld({type_val}): {json.dumps(item)[:500]}")
+                except json.JSONDecodeError:
+                    pass
+
+        return results
+
+    def set_session_headers(self, headers: Dict[str, str]):
+        """Set session headers to use when replaying API calls."""
+        self._session_headers.update(headers)
+
+    def set_auth_token(self, token_type: str, token: str):
+        """Set authentication token for API replay."""
+        self._auth_tokens[token_type] = token
+
+    def get_auth_headers(self) -> Dict[str, str]:
+        """Build auth headers from stored tokens."""
+        headers = {}
+        for token_type, token in self._auth_tokens.items():
+            if token_type == 'bearer':
+                headers['Authorization'] = f'Bearer {token}'
+            elif token_type == 'jwt':
+                headers['Authorization'] = f'Bearer {token}'
+            elif token_type == 'cookie':
+                headers['Cookie'] = token
+            else:
+                headers[token_type] = token
+        return headers
 
     def replay_api_call(self, url: str, method: str = "GET",
                         headers: Optional[Dict] = None,
                         timeout: int = 10) -> Optional[Dict[str, Any]]:
-        """Replay a captured API call to fetch fresh content."""
+        """Replay a captured API call with auth/session support to fetch fresh content."""
         try:
             import urllib.request
             import urllib.error
 
             req = urllib.request.Request(url, method=method)
+
+            # Merge session headers, auth headers, and caller-provided headers
+            merged_headers = dict(self._session_headers)
+            merged_headers.update(self.get_auth_headers())
             if headers:
-                for k, v in headers.items():
-                    req.add_header(k, v)
+                merged_headers.update(headers)
+
+            for k, v in merged_headers.items():
+                req.add_header(k, v)
             req.add_header('Accept', 'application/json, text/plain, */*')
             req.add_header('User-Agent', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36')
+            req.add_header('Referer', 'https://example.com/')
 
             resp = urllib.request.urlopen(req, timeout=timeout)
             raw = resp.read().decode('utf-8', errors='ignore')
 
+            result: Dict[str, Any] = {"status": resp.status, "raw": raw[:10000]}
+
+            # Try to parse as JSON and extract useful fields
             try:
-                return {"status": resp.status, "data": json.loads(raw), "raw": raw[:5000]}
+                data = json.loads(raw)
+                result["data"] = data
+                # Auto-extract article content from common response shapes
+                extracted = self._extract_content_from_json(data)
+                if extracted:
+                    result["extracted_text"] = extracted
+                    result["extraction_method"] = "json_extraction"
             except json.JSONDecodeError:
-                return {"status": resp.status, "data": None, "raw": raw[:5000]}
+                result["data"] = None
+
+            return result
 
         except Exception as e:
             logger.error(f"API replay failed for {url}: {e}")
             return None
+
+    def _extract_content_from_json(self, data: Any) -> Optional[str]:
+        """Auto-extract article text from common API response structures."""
+        if not isinstance(data, dict):
+            return None
+
+        # Common article content field names
+        content_keys = [
+            'content', 'article_body', 'body', 'text', 'html', 'description',
+            'summary', 'excerpt', 'full_article', 'articleContent', 'postContent',
+            'story', 'data',
+        ]
+
+        def try_extract(obj):
+            if not isinstance(obj, dict):
+                return None
+            for key in content_keys:
+                if key in obj:
+                    val = obj[key]
+                    if isinstance(val, str) and len(val) > 50:
+                        return self._clean_html_to_text(val)
+            return None
+
+        # Direct match at top level
+        result = try_extract(data)
+        if result:
+            return result
+
+        # Nested under 'data' or 'article' — go two levels deep
+        for wrapper_key in ['data', 'article', 'post', 'story', 'entry', 'props']:
+            if wrapper_key in data and isinstance(data[wrapper_key], dict):
+                inner = data[wrapper_key]
+                result = try_extract(inner)
+                if result:
+                    return result
+                # Go one more level deep
+                for nested_key in ['article', 'pageProps', 'content', 'data', 'result']:
+                    if nested_key in inner and isinstance(inner[nested_key], dict):
+                        result = try_extract(inner[nested_key])
+                        if result:
+                            return result
+
+        # Check list items (e.g., paginated articles)
+        for key in ['items', 'articles', 'posts', 'results', 'edges']:
+            if key in data and isinstance(data[key], list):
+                texts = []
+                for item in data[key][:5]:  # First 5 items
+                    extracted = try_extract(item)
+                    if extracted:
+                        texts.append(extracted)
+                if texts:
+                    return '\n\n'.join(texts)
+
+        return None
+
+    @staticmethod
+    def _clean_html_to_text(html_content: str) -> str:
+        """Convert HTML content to clean text."""
+        import html as html_module
+        # Remove script/style tags
+        text = re.sub(r'<script[^>]*>.*?</script>', '', html_content, flags=re.IGNORECASE | re.DOTALL)
+        text = re.sub(r'<style[^>]*>.*?</style>', '', html_content, flags=re.IGNORECASE | re.DOTALL)
+        # Remove HTML tags but keep newlines
+        text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
+        text = re.sub(r'</?(?:p|div|h[1-6]|li|tr)', '\n', text, flags=re.IGNORECASE)
+        text = re.sub(r'<[^>]+>', '', text)
+        # Decode HTML entities
+        text = html_module.unescape(text)
+        # Clean whitespace
+        lines = [line.strip() for line in text.splitlines()]
+        lines = [l for l in lines if l]
+        return '\n'.join(lines)
+
+    def extract_article_from_response(self, response: Dict[str, Any]) -> Optional[str]:
+        """Extract readable article text from a replayed API response."""
+        if not response:
+            return None
+
+        # If already extracted
+        if response.get("extracted_text"):
+            return response["extracted_text"]
+
+        data = response.get("data")
+        if data and isinstance(data, dict):
+            return self._extract_content_from_json(data)
+
+        raw = response.get("raw", "")
+        if raw:
+            try:
+                data = json.loads(raw)
+                if isinstance(data, dict):
+                    return self._extract_content_from_json(data)
+            except json.JSONDecodeError:
+                pass
+
+        return None
 
     def get_captured_apis(self) -> List[Dict[str, Any]]:
         """Return all captured API interactions."""
@@ -741,8 +957,9 @@ class PaywallBypassOrchestrator:
         "cache_lookup": 0,       # Zero cost, zero detection
         "rule_based_strip": 1,   # Lightweight, works on static HTML
         "browser_dom_manipulation": 2,  # JS rendering, moderate cost
-        "session_auth": 3,       # Requires pre-configured session
-        "proxy_fetch": 4,        # Network cost, proxy dependency
+        "api_interception": 3,   # Replay captured API calls for content
+        "session_auth": 4,       # Requires pre-configured session
+        "proxy_fetch": 5,        # Network cost, proxy dependency
     }
 
     # Paywall type → recommended starting strategy
@@ -754,18 +971,18 @@ class PaywallBypassOrchestrator:
         "js_rendered": "browser_dom_manipulation",
         "unknown": "rule_based_strip",
     }
-
     def __init__(self, config: Optional[Dict] = None):
         self.config = config or {}
         self.ladder_proxy = LadderProxyBypass(
-            proxy_url=self.config.get("proxy_url")
+            proxy_url=self.config.get("proxy_url"),
         )
         self.dom_manipulator = DOMManipulationBypass(
-            headless=self.config.get("headless", True)
+            headless=self.config.get("headless", True),
         )
         self.rule_engine = RuleBasedPaywallBypass()
         self.cache_retriever = CacheContentRetriever()
         self.session_manager = SessionCookieManager()
+        self.api_engine = APIInterceptionEngine()
         self.api_interceptor = APIInterceptionEngine()
 
         # Custom rules from user
@@ -783,6 +1000,7 @@ class PaywallBypassOrchestrator:
             "cache_lookup": {"attempts": 0, "successes": 0},
             "rule_based_strip": {"attempts": 0, "successes": 0},
             "browser_dom_manipulation": {"attempts": 0, "successes": 0},
+            "api_interception": {"attempts": 0, "successes": 0},
             "session_auth": {"attempts": 0, "successes": 0},
             "proxy_fetch": {"attempts": 0, "successes": 0},
         }
@@ -926,6 +1144,53 @@ class PaywallBypassOrchestrator:
                 if browser_html and len(browser_html) > 1000:
                     browser_html = self.rule_engine.apply_rules(browser_html)
                     return True, browser_html
+
+            elif strategy == "api_interception":
+                if not html:
+                    return False, None
+                # Discover API endpoints from HTML
+                discovered = self.api_engine.find_content_apis(html)
+                if not discovered:
+                    return False, None
+                # Try to extract embedded JSON content directly
+                for item in discovered:
+                    if item.startswith('embedded:') or item.startswith('__NEXT') or \
+                       item.startswith('__NUXT__') or item.startswith('__INITIAL') or \
+                       item.startswith('__DATA__'):
+                        try:
+                            # Extract the JSON part after the prefix
+                            json_str = item.split(': ', 1)[1] if ': ' in item else item
+                            data = json.loads(json_str[:2000])  # Limit size
+                            extracted = self.api_engine._extract_content_from_json(data)
+                            if extracted and len(extracted) > 200:
+                                return True, extracted
+                        except (json.JSONDecodeError, IndexError):
+                            pass
+                    elif item.startswith('graphql:'):
+                        # GraphQL query found — record it for later replay
+                        query_text = item.split(': ', 1)[1] if ': ' in item else item
+                        self.api_engine.capture_request(
+                            url=f"graphql://{url}",
+                            method="POST",
+                            response_data={"query": query_text[:500]},
+                        )
+                    elif item.startswith('json-ld'):
+                        # JSON-LD structured data — try to extract article text
+                        try:
+                            json_str = item.split(': ', 1)[1] if ': ' in item else item
+                            data = json.loads(json_str[:2000])
+                            extracted = self.api_engine._extract_content_from_json(data)
+                            if extracted and len(extracted) > 200:
+                                return True, extracted
+                        except (json.JSONDecodeError, IndexError):
+                            pass
+                # If we discovered API patterns but couldn't extract inline,
+                # try replaying known API endpoints
+                for api_url in discovered:
+                    if api_url.startswith('/api/') or api_url.startswith('http'):
+                        resp = self.api_engine.replay_api_call(api_url)
+                        if resp and resp.get("extracted_text"):
+                            return True, resp["extracted_text"]
                 return False, None
 
             elif strategy == "session_auth":

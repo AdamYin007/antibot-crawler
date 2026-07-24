@@ -308,6 +308,14 @@ result = orchestrator.bypass_with_session(
 - Archive.org缓存查询
 - Sci-Hub学术数据库
 
+## 调试经验与常见陷阱
+
+详见 `references/paywall-bypass-debugging.md`，记录了以下实战中遇到的关键问题及修复方案：
+- **Cache Lookup误判**：Wayback/Google缓存可能返回搜索结果页面而非实际内容，需验证域名匹配
+- **正则匹配标签过窄**：原只匹配div/section等标签，需改为匹配任意HTML标签类型
+- **curl_cffi版本兼容**：`CHROME_133` 在某些版本不支持，应默认使用 `CHROME="chrome"`
+- **默认规则缺失通用选择器**：需添加 `.paywall-overlay/.pw-container` 等通用规则
+
 ## License
 
 MIT

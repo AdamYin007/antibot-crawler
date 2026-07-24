@@ -1,7 +1,7 @@
 ---
 name: antibot-crawler
 description: Universal anti-detection web crawler combining best features of Firecrawl, Scrapling, Scrapy. TLS fingerprinting, Cloudflare bypass, proxy rotation, CAPTCHA solving, adaptive selectors, 5-method paywall bypass engine. Integrated into main fetch pipeline with auto-detection and multi-strategy bypass.
-version: 2.0.0
+version: 2.1.0
 ---
 
 # AntiBotCrawler Skill
@@ -151,11 +151,74 @@ Optional (for CAPTCHA):
 - Configurable rate limiting to avoid triggering anti-bot systems
 - Detailed error reporting in `CrawlResult.error` field
 
-## 付费墙绕过引擎 (v2.0 新增)
+## 付费墙绕过引擎 (v2.1)
 
-基于GitHub Top 5付费墙绕过工具分析，集成5种核心技术：
+基于GitHub Top 5付费墙绕过工具分析，集成5种核心技术，已深度集成到主抓取管线中。
 
-### 1. Ladder代理模式 (⭐8730)
+### 自动检测与渐进式绕过
+
+启用 `--paywall-bypass` 后，爬虫会自动：
+1. 获取原始HTML
+2. 分析付费墙类型（overlay/blur/metered/login_required）
+3. 按优先级尝试绕过策略：缓存查询 → 规则剥离 → 浏览器DOM操作 → 代理抓取
+4. 记录每次策略的成功率，下次自动优化顺序
+
+### 使用方式
+
+#### CLI
+```bash
+# 自动检测并绕过付费墙
+python -m antibot_crawler https://example.com/article --paywall-bypass -o markdown
+
+# 指定绕过策略
+python -m antibot_crawler https://example.com/article --paywall-bypass --paywall-strategy browser
+
+# 使用代理
+python -m antibot_crawler https://example.com/article --paywall-bypass --paywall-proxy http://proxy:8080
+
+# 使用已认证会话
+python -m antibot_crawler https://example.com/article --paywall-bypass --paywall-session my-session-id
+```
+
+#### Python API
+```python
+from antibot_crawler import AntiBotCrawler, CrawlerConfig
+
+# 自动模式（推荐）
+crawler = AntiBotCrawler(CrawlerConfig(
+    enable_paywall_bypass=True,
+    paywall_bypass_strategy="auto",
+))
+result = crawler.fetch("https://example.com/article")
+print(f"Paywall bypassed via: {result.paywall_technique}")
+print(result.markdown)
+
+# 手动指定策略
+crawler = AntiBotCrawler(CrawlerConfig(
+    enable_paywall_bypass=True,
+    paywall_bypass_strategy="browser",  # 或 "cache", "proxy"
+))
+
+# 带认证会话
+crawler = AntiBotCrawler(CrawlerConfig(
+    enable_paywall_bypass=True,
+    paywall_session_id="my-auth-session",
+))
+
+# 自定义绕过规则
+from antibot_crawler.paywall_bypass import RuleBasedPaywallBypass
+rules = [
+    {"name": "custom-rule", "selector": ".my-site-paywall", "action": "remove_element"},
+]
+crawler = AntiBotCrawler(CrawlerConfig(
+    enable_paywall_bypass=True,
+    paywall_custom_rules=rules,
+))
+```
+
+### 各技术详解
+
+#### 1. Ladder代理模式 (⭐8730)
 自动移除HTML中的付费墙覆盖层、CORS限制、模糊效果。
 
 ```python
